@@ -1,19 +1,51 @@
 """
-PHASE 3: Facility Harvester Script
-==================================
-This script scrapes facility metadata from the eCampusOntario OCIP Express portal.
-It navigates the HEI dropdown, handles pagination, and extracts the 'Manage' links
-from the specific table column (16th column) identified.
+PHASE 3: Facility Harvester Script — ENHANCED
+==============================================
+Features:
+  - Progress bars (tqdm) with % completion
+  - Smart empty-page detection with extended wait + retry before declaring empty
+  - Post-scrape interactive menu: re-visit ALL empty or specific institutions by number
+  - WebDriver only launches AFTER checkpoint prompt
+  - Robust pagination: waits for rows to stabilize before moving on
+  - Checkpoint save/load
+  - Colored console output
 
-Author: AI Assistant
-Version: 1.0
-Based on Phase 1 Framework
+Version: 2.0
 """
 
 import time
 import json
 import re
+import sys
+import os
 import pandas as pd
+from datetime import datetime
+
+# ── Optional colored output ─────────────────────────────────────────────────
+try:
+    from colorama import init, Fore, Style
+    init(autoreset=True)
+    def green(s):  return Fore.GREEN  + str(s) + Style.RESET_ALL
+    def red(s):    return Fore.RED    + str(s) + Style.RESET_ALL
+    def yellow(s): return Fore.YELLOW + str(s) + Style.RESET_ALL
+    def cyan(s):   return Fore.CYAN   + str(s) + Style.RESET_ALL
+    def bold(s):   return Style.BRIGHT + str(s) + Style.RESET_ALL
+except ImportError:
+    def green(s):  return str(s)
+    def red(s):    return str(s)
+    def yellow(s): return str(s)
+    def cyan(s):   return str(s)
+    def bold(s):   return str(s)
+
+# ── Optional tqdm progress bar ───────────────────────────────────────────────
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    print(yellow("[WARN] tqdm not installed. Run: pip install tqdm  (progress bars disabled)"))
+
+# ── Selenium ─────────────────────────────────────────────────────────────────
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -22,24 +54,35 @@ from selenium.common.exceptions import (
     TimeoutException,
     NoSuchElementException,
     StaleElementReferenceException,
-    ElementClickInterceptedException
+    ElementClickInterceptedException,
 )
-from datetime import datetime
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-LOGIN_URL = "https://www.ocip.express/"
-TARGET_URL = "https://www.ocip.express/FacilityAdmin/Index"
-OUTPUT_JSON = "facilities_master_list.json"
-OUTPUT_EXCEL = "facilities_master_list.xlsx"
-CHECKPOINT_FILE = "phase3_checkpoint.json"
+LOGIN_URL        = "https://www.ocip.express/"
+TARGET_URL       = "https://www.ocip.express/FacilityAdmin/Index"
+OUTPUT_JSON      = "facilities_master_list.json"
+OUTPUT_EXCEL     = "facilities_master_list.xlsx"
+CHECKPOINT_FILE  = "phase3_checkpoint.json"
 
-# Timing Configuration
-PAGE_LOAD_WAIT = 2.0
-PAGINATION_WAIT = 1.5
-DROPDOWN_CLOSE_WAIT = 0.5
-LOADING_MASK_TIMEOUT = 10
+# ── Timing (seconds) ──────────────────────────────────────────────────────────
+PAGE_LOAD_WAIT          = 1.5   # after selecting institution, base wait
+PAGINATION_WAIT         = 2.0   # after clicking next page
+DROPDOWN_CLOSE_WAIT     = 0.7
+LOADING_MASK_TIMEOUT    = 15    # how long to wait for k-loading-mask to vanish
+
+# ── Empty-page detection ──────────────────────────────────────────────────────
+# If 0 rows found immediately, we wait EMPTY_RETRY_WAIT seconds and try again,
+# up to EMPTY_MAX_RETRIES times before giving up and declaring the page empty.
+EMPTY_RETRY_WAIT   = 0.5   # seconds to wait between retries
+EMPTY_MAX_RETRIES  = 3     # total extra attempts
+
+# ── Row stabilisation ─────────────────────────────────────────────────────────
+# After navigating to a page we poll until the row count stops changing.
+ROW_STABLE_POLLS      = 2      # how many consecutive same-count reads before "stable"
+ROW_STABLE_INTERVAL   = 1.0    # seconds between polls
+ROW_STABLE_TIMEOUT    = 3     # give up after this many seconds total
 
 # ==========================================
 # DRIVER SETUP
@@ -52,296 +95,401 @@ def get_driver():
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
     options.add_experimental_option("detach", True)
-
     driver = webdriver.Chrome(options=options)
-    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    driver.execute_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    )
     return driver
 
 # ==========================================
-# UTILITY FUNCTIONS
+# UTILITY: Loading / Waiting
 # ==========================================
 def wait_for_loading_complete(driver, timeout=LOADING_MASK_TIMEOUT):
-    """Wait for loading masks to disappear."""
+    """Wait for Kendo loading masks to vanish."""
     try:
-        time.sleep(0.3)
+        time.sleep(0.4)
         WebDriverWait(driver, timeout).until(
             EC.invisibility_of_element_located((By.CSS_SELECTOR, ".k-loading-mask"))
         )
-    except:
+        time.sleep(0.3)
+    except Exception:
         pass
 
-def parse_pagination_info(driver):
-    """Parse pagination text (e.g., '1 - 50 of 120 items')."""
+
+def wait_for_rows_stable(driver, timeout=ROW_STABLE_TIMEOUT):
+    """
+    Poll the row count until it stops changing for ROW_STABLE_POLLS consecutive
+    reads, or timeout expires.  Returns the stable list of rows.
+    """
+    deadline  = time.time() + timeout
+    last_count = -1
+    streak     = 0
+
+    while time.time() < deadline:
+        try:
+            rows = driver.find_elements(By.CSS_SELECTOR, "tr.k-master-row")
+        except Exception:
+            rows = []
+        count = len(rows)
+
+        if count == last_count and count > 0:
+            streak += 1
+            if streak >= ROW_STABLE_POLLS:
+                return rows          # stable non-empty result
+        else:
+            streak = 0
+            last_count = count
+
+        time.sleep(ROW_STABLE_INTERVAL)
+
+    # Return whatever we have
     try:
-        pager_info = driver.find_element(By.CSS_SELECTOR, "span.k-pager-info.k-label")
-        info_text = pager_info.text.strip()
-        match = re.match(r'(\d+)\s*-\s*(\d+)\s+of\s+(\d+)\s+items?', info_text)
-        if match:
-            return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
-        return (0, 0, 0)
-    except:
-        return (0, 0, 0)
+        return driver.find_elements(By.CSS_SELECTOR, "tr.k-master-row")
+    except Exception:
+        return []
+
+
+def wait_for_rows_with_retry(driver, institution_name):
+    """
+    Try to get rows.  If none found, wait EMPTY_RETRY_WAIT and retry up to
+    EMPTY_MAX_RETRIES times before concluding the institution is truly empty.
+    Returns (rows, declared_empty: bool)
+    """
+    # First attempt: wait for stability
+    rows = wait_for_rows_stable(driver)
+    if rows:
+        return rows, False
+
+    # Extended retry loop for slow-loading pages
+    for attempt in range(1, EMPTY_MAX_RETRIES + 1):
+        print(yellow(f"         ⏳ No rows yet — waiting {EMPTY_RETRY_WAIT}s "
+                     f"(attempt {attempt}/{EMPTY_MAX_RETRIES}) for {institution_name}…"))
+        time.sleep(EMPTY_RETRY_WAIT)
+        wait_for_loading_complete(driver)
+
+        rows = wait_for_rows_stable(driver)
+        if rows:
+            print(green(f"         ✓ Rows appeared after {attempt} extra wait(s)"))
+            return rows, False
+
+        # Also check pagination info — data might be present but rows styled differently
+        start, end, total = parse_pagination_info(driver)
+        if total > 0:
+            # Data exists, try once more with a long wait
+            print(yellow(f"         ℹ Pagination says {total} items — waiting extra…"))
+            time.sleep(EMPTY_RETRY_WAIT * 2)
+            wait_for_loading_complete(driver)
+            rows = wait_for_rows_stable(driver)
+            if rows:
+                return rows, False
+
+    return [], True  # genuinely empty after all retries
+
+# ==========================================
+# UTILITY: Pagination
+# ==========================================
+def parse_pagination_info(driver):
+    """Return (start, end, total) from pager label, e.g. '1 - 50 of 120 items'."""
+    try:
+        pager = driver.find_element(By.CSS_SELECTOR, "span.k-pager-info.k-label")
+        text  = pager.text.strip()
+        m = re.match(r'(\d+)\s*-\s*(\d+)\s+of\s+(\d+)\s+items?', text)
+        if m:
+            return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    except Exception:
+        pass
+    return 0, 0, 0
+
 
 def has_next_page(driver):
-    """Check if next page button is active."""
     try:
-        next_btn = driver.find_element(By.CSS_SELECTOR, "a.k-pager-nav[aria-label='Go to the next page']")
-        return next_btn.get_attribute("aria-disabled") != "true"
-    except:
+        btn = driver.find_element(
+            By.CSS_SELECTOR, "a.k-pager-nav[aria-label='Go to the next page']"
+        )
+        return btn.get_attribute("aria-disabled") != "true"
+    except Exception:
         return False
+
 
 def click_next_page(driver, wait):
-    """Click next page button."""
     try:
-        next_btn = wait.until(EC.element_to_be_clickable(
+        btn = wait.until(EC.element_to_be_clickable(
             (By.CSS_SELECTOR, "a.k-pager-nav[aria-label='Go to the next page']")
         ))
-        if next_btn.get_attribute("aria-disabled") == "true":
+        if btn.get_attribute("aria-disabled") == "true":
             return False
-        
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", next_btn)
-        time.sleep(0.2)
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+        time.sleep(0.3)
         try:
-            next_btn.click()
-        except:
-            driver.execute_script("arguments[0].click();", next_btn)
-        
+            btn.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", btn)
         wait_for_loading_complete(driver)
         time.sleep(PAGINATION_WAIT)
         return True
-    except:
+    except Exception:
         return False
+
 
 def reset_to_first_page(driver, wait):
-    """Reset grid to page 1."""
     try:
-        start, end, total = parse_pagination_info(driver)
-        if start <= 1: return True
-
-        first_btn = wait.until(EC.element_to_be_clickable(
-            (By.CSS_SELECTOR, "a.k-pager-nav.k-pager-first[aria-label='Go to the first page']")
+        start, _, _ = parse_pagination_info(driver)
+        if start <= 1:
+            return True
+        btn = wait.until(EC.element_to_be_clickable(
+            (By.CSS_SELECTOR,
+             "a.k-pager-nav.k-pager-first[aria-label='Go to the first page']")
         ))
-        if first_btn.get_attribute("aria-disabled") == "true": return True
-
-        driver.execute_script("arguments[0].click();", first_btn)
+        if btn.get_attribute("aria-disabled") == "true":
+            return True
+        driver.execute_script("arguments[0].click();", btn)
         wait_for_loading_complete(driver)
         time.sleep(PAGINATION_WAIT)
-        print("         → Reset to page 1")
         return True
-    except:
+    except Exception:
         return False
 
-def save_checkpoint(data, current_index, institution_names):
-    """Save progress."""
+# ==========================================
+# CHECKPOINT
+# ==========================================
+def save_checkpoint(data, current_index, institution_names, empty_institutions):
     checkpoint = {
-        "timestamp": datetime.now().isoformat(),
-        "current_index": current_index,
-        "total_institutions": len(institution_names),
+        "timestamp":            datetime.now().isoformat(),
+        "current_index":        current_index,
+        "total_institutions":   len(institution_names),
         "facilities_collected": len(data),
-        "data": data
+        "institution_names":    institution_names,
+        "empty_institutions":   empty_institutions,   # list of {index, name}
+        "data":                 data,
     }
     with open(CHECKPOINT_FILE, 'w', encoding='utf-8') as f:
         json.dump(checkpoint, f, indent=2)
 
+
 def load_checkpoint():
-    """Load progress."""
     try:
         with open(CHECKPOINT_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
-    except:
+    except Exception:
         return None
 
 # ==========================================
 # MODULE 1: Get Institution Names
 # ==========================================
 def get_institution_names(driver, wait):
-    """Get list of institutions from the filter dropdown."""
-    print("\n" + "=" * 50)
-    print("GATHERING INSTITUTION LIST")
-    print("=" * 50)
+    print("\n" + "=" * 55)
+    print(bold("  GATHERING INSTITUTION LIST"))
+    print("=" * 55)
     try:
-        # Targeting the dropdown arrow/container
-        # Based on user input: /html/body/div[2]/div/div[5]/div[3]/div[2]/div[1]/div/div[2]/span/span[1]
-        # We look for the aria-controls usually associated with 'HeiId_listbox' or similar
-        
-        dropdown_trigger = wait.until(EC.element_to_be_clickable(
-            (By.CSS_SELECTOR, "span[aria-controls$='listbox']") # Generic 'ends with listbox' to be safe
+        trigger = wait.until(EC.element_to_be_clickable(
+            (By.CSS_SELECTOR, "span[aria-controls$='listbox']")
         ))
-        dropdown_trigger.click()
+        trigger.click()
 
-        # Wait for listbox (Checking standard HeiId_listbox or just any visible listbox)
-        listbox = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, "ul[id$='listbox'][aria-hidden='false']")))
-        time.sleep(0.5)
+        listbox = wait.until(EC.visibility_of_element_located(
+            (By.CSS_SELECTOR, "ul[id$='listbox'][aria-hidden='false']")
+        ))
+        time.sleep(0.6)
 
         options = listbox.find_elements(By.TAG_NAME, "li")
         names = []
         for opt in options:
             text = opt.text.strip()
-            if text and "Select HEI" not in text and text != "":
+            if text and "Select HEI" not in text:
                 names.append(text)
 
-        print(f"✓ Found {len(names)} institutions to process")
-        
-        # Close dropdown
+        print(green(f"  ✓ Found {len(names)} institutions"))
         driver.find_element(By.TAG_NAME, "body").click()
         time.sleep(DROPDOWN_CLOSE_WAIT)
         return names
 
     except Exception as e:
-        print(f"✗ FAILED to get institutions: {e}")
+        print(red(f"  ✗ FAILED: {e}"))
         return []
 
 # ==========================================
 # MODULE 2: Select Institution
 # ==========================================
 def select_institution(driver, wait, target_name):
-    """Select specific institution from dropdown."""
     try:
-        dropdown_trigger = wait.until(EC.element_to_be_clickable(
+        trigger = wait.until(EC.element_to_be_clickable(
             (By.CSS_SELECTOR, "span[aria-controls$='listbox']")
         ))
-        dropdown_trigger.click()
+        trigger.click()
 
-        listbox = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, "ul[id$='listbox'][aria-hidden='false']")))
-        time.sleep(0.3)
+        listbox = wait.until(EC.visibility_of_element_located(
+            (By.CSS_SELECTOR, "ul[id$='listbox'][aria-hidden='false']")
+        ))
+        time.sleep(0.4)
 
-        all_options = listbox.find_elements(By.TAG_NAME, "li")
-        target_element = None
-        for opt in all_options:
+        for opt in listbox.find_elements(By.TAG_NAME, "li"):
             if target_name in opt.text:
-                target_element = opt
-                break
+                driver.execute_script("arguments[0].click();", opt)
+                wait_for_loading_complete(driver)
+                time.sleep(PAGE_LOAD_WAIT)
+                return True
 
-        if target_element:
-            driver.execute_script("arguments[0].click();", target_element)
-            wait_for_loading_complete(driver)
-            time.sleep(PAGE_LOAD_WAIT)
-            return True
-        else:
-            driver.find_element(By.TAG_NAME, "body").click()
-            return False
-    except:
+        driver.find_element(By.TAG_NAME, "body").click()
+        return False
+
+    except Exception:
         try:
             driver.find_element(By.TAG_NAME, "body").click()
-        except:
+        except Exception:
             pass
         return False
 
 # ==========================================
-# MODULE 3: Scrape Facility Table
+# MODULE 3: Scrape One Page of Rows
 # ==========================================
-def scrape_current_page(driver, institution_name):
+def scrape_rows(rows, institution_name):
     """
-    Scrape facility rows.
-    Targeting specific table structure where Manage link is in the 16th column (index 15).
+    Extract data from a stable list of tr.k-master-row elements.
+    Looks at the screenshot: columns are
+      0: Branch/HEI abbrev  1: Facility Name  2: Facility Type
+      3: Experts?  4: Equipment?  5: Enabled  6: Actions (Manage link)
+    Adjust indices if the live page differs.
     """
-    try:
-        # Table container: /html/body/div[2]/div/div[5]/div[4]
-        # Rows: .k-master-row
-        rows = driver.find_elements(By.CSS_SELECTOR, "tr.k-master-row")
-    except:
-        return []
-
-    if not rows:
-        return []
-
     page_data = []
-    
+
     for row in rows:
         try:
             cells = row.find_elements(By.TAG_NAME, "td")
-            
-            # User specified logic: tr[1]/td[16]/div
-            # Index 15 corresponds to the 16th td
-            if len(cells) < 16:
-                # Fallback if table is smaller than expected
+            if not cells:
                 continue
 
-            # Extract basic visible data (indices are approximate, assuming standard layout)
-            # Usually: ID(0 or 1), Name(2 or 3), Type(4), etc.
-            # We grab a few early columns to ensure we have identification
-            try:
-                facility_id = cells[1].text.strip() # Guessing ID column
-                facility_name = cells[3].text.strip() # Guessing Name column
-                facility_type = cells[4].text.strip() # Guessing Type column
-            except:
-                facility_id = "Unknown"
-                facility_name = cells[2].text.strip() if len(cells) > 2 else "Unknown"
-                facility_type = ""
-
-            # --- EXTRACT MANAGE LINK (CRITICAL STEP) ---
-            manage_url = "Not Found"
-            try:
-                # Target the 16th cell (index 15)
-                target_cell = cells[15] 
-                
-                # Look for anchor tag inside the div inside the cell
-                link_elem = target_cell.find_element(By.TAG_NAME, "a")
-                manage_url = link_elem.get_attribute("href")
-                
-                # Double check title just in case
-                if not manage_url and "View" not in link_elem.get_attribute("title"):
-                     # Try finding any link in that cell
-                     pass
-            except NoSuchElementException:
-                # Fallback: Look for any link with "Details" or "View" in the whole row
+            def cell_text(idx):
                 try:
-                    links = row.find_elements(By.CSS_SELECTOR, "a[href*='Details'], a[title='View Full Details']")
-                    if links:
-                        manage_url = links[0].get_attribute("href")
-                except:
+                    return cells[idx].text.strip()
+                except Exception:
+                    return ""
+
+            branch        = cell_text(0)
+            facility_name = cell_text(1)
+            facility_type = cell_text(2)
+
+            # --- Manage / Actions link ---
+            manage_url = "Not Found"
+
+            # Strategy 1: last cell contains the link
+            try:
+                link = cells[-1].find_element(By.TAG_NAME, "a")
+                manage_url = link.get_attribute("href") or "Not Found"
+            except Exception:
+                pass
+
+            # Strategy 2: scan all cells for href containing 'Manage' or 'Details'
+            if manage_url == "Not Found":
+                try:
+                    for cell in cells:
+                        links = cell.find_elements(By.TAG_NAME, "a")
+                        for lnk in links:
+                            href = lnk.get_attribute("href") or ""
+                            title = lnk.get_attribute("title") or lnk.text or ""
+                            if any(kw in href or kw in title
+                                   for kw in ["Manage", "Details", "Edit", "View"]):
+                                manage_url = href
+                                break
+                        if manage_url != "Not Found":
+                            break
+                except Exception:
                     pass
 
-            record = {
-                "Institution": institution_name,
+            page_data.append({
+                "Institution":   institution_name,
+                "Branch":        branch,
                 "Facility_Name": facility_name,
-                "Facility_ID": facility_id,
-                "Type": facility_type,
-                "Manage_URL": manage_url,
-                "Scraped_At": datetime.now().isoformat()
-            }
-            
-            # Only add if we found a URL (or decide to keep all rows)
-            page_data.append(record)
+                "Facility_Type": facility_type,
+                "Manage_URL":    manage_url,
+                "Scraped_At":    datetime.now().isoformat(),
+            })
 
         except StaleElementReferenceException:
             continue
-        except Exception as e:
+        except Exception:
             continue
 
     return page_data
 
 # ==========================================
-# MODULE 4: Pagination Loop
+# MODULE 4: Full Pagination Loop
 # ==========================================
 def scrape_all_pages_for_institution(driver, wait, institution_name):
-    """Scrape all pages for a facility."""
+    """
+    Scrapes all pages for one institution.
+    Uses wait_for_rows_with_retry so slow-loading pages are not skipped.
+    """
     all_facilities = []
-    current_page = 1
-    
-    start, end, total = parse_pagination_info(driver)
-    
-    if total == 0:
-        print(f"      → No facilities found")
-        return []
+    current_page   = 1
 
-    print(f"      → Found {total} facilities")
+    # ── First page: use the extended retry logic ──────────────────────────────
+    rows, is_empty = wait_for_rows_with_retry(driver, institution_name)
+
+    if is_empty:
+        # One final check via pagination label
+        _, _, total = parse_pagination_info(driver)
+        if total == 0:
+            return []          # Genuinely no data
+        # Pagination says there IS data — wait a bit more
+        print(yellow(f"         ⚠ Pagination says {total} items but no rows visible. "
+                     f"Waiting extra 10s…"))
+        time.sleep(10)
+        wait_for_loading_complete(driver)
+        rows = wait_for_rows_stable(driver)
+        if not rows:
+            return []
+
+    _, _, total = parse_pagination_info(driver)
+    print(cyan(f"      → Detected {total if total else '?'} total facilities"))
+
+    # Progress bar for pages (estimate)
+    pages_estimate = max(1, (total // 50) + 1) if total else 999
+
+    page_bar = None
+    if TQDM_AVAILABLE and total:
+        page_bar = tqdm(
+            total=total,
+            desc=f"      {institution_name[:30]}",
+            unit="row",
+            leave=False,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} rows [{elapsed}<{remaining}]"
+        )
 
     while True:
-        page_data = scrape_current_page(driver, institution_name)
+        page_data = scrape_rows(rows, institution_name)
         all_facilities.extend(page_data)
-        print(f"         Page {current_page}: Scraped {len(page_data)} records")
 
-        start, end, total = parse_pagination_info(driver)
-        if end >= total or not has_next_page(driver):
+        if page_bar:
+            page_bar.update(len(page_data))
+
+        print(f"         Page {current_page}: {green(str(len(page_data)))} records  "
+              f"(running total: {len(all_facilities)})")
+
+        # Check if we should move to next page
+        start, end, total_now = parse_pagination_info(driver)
+        if not has_next_page(driver) or (total_now > 0 and end >= total_now):
             break
 
-        if click_next_page(driver, wait):
-            current_page += 1
-        else:
+        if not click_next_page(driver, wait):
             break
-            
-        if current_page > 50: break # Safety
+
+        # Wait for the *new* page rows to stabilise before scraping
+        rows = wait_for_rows_stable(driver)
+        if not rows:
+            # Try once more with extra time
+            time.sleep(EMPTY_RETRY_WAIT)
+            wait_for_loading_complete(driver)
+            rows = wait_for_rows_stable(driver)
+            if not rows:
+                print(yellow("         ⚠ No rows on this page after waiting — stopping pagination"))
+                break
+
+        current_page += 1
+        if current_page > 200:   # absolute safety
+            break
+
+    if page_bar:
+        page_bar.close()
 
     if current_page > 1:
         reset_to_first_page(driver, wait)
@@ -349,78 +497,300 @@ def scrape_all_pages_for_institution(driver, wait, institution_name):
     return all_facilities
 
 # ==========================================
-# MAIN EXECUTION
+# SCRAPE ONE INSTITUTION (helper)
+# ==========================================
+def scrape_institution(driver, wait, uni_name, idx, total_count):
+    """Select an institution and scrape all its pages. Returns list of records."""
+    print(f"\n[{idx + 1}/{total_count}] {bold(uni_name)}")
+
+    if not select_institution(driver, wait, uni_name):
+        print(red("      ✗ Selection failed — skipping"))
+        return None   # None = selection error, distinct from []
+
+    data = scrape_all_pages_for_institution(driver, wait, uni_name)
+    return data
+
+# ==========================================
+# POST-SCRAPE INTERACTIVE MENU
+# ==========================================
+def post_scrape_menu(driver, wait, master_list, empty_institutions, institution_names):
+    """
+    After the main scrape, ask the user if they want to re-visit empties.
+    Allows: re-visit ALL empties, specific ones by number, or finish.
+    """
+    if not empty_institutions:
+        print(green("\n✓ No empty institutions detected — all done!"))
+        return master_list
+
+    print("\n" + "=" * 60)
+    print(bold("  POST-SCRAPE: EMPTY INSTITUTIONS REVIEW"))
+    print("=" * 60)
+    print(yellow(f"  {len(empty_institutions)} institution(s) had NO data collected:\n"))
+
+    for item in empty_institutions:
+        print(f"    [{item['index'] + 1:>3}] {item['name']}")
+
+    while True:
+        print("\n" + "-" * 60)
+        print("  Options:")
+        print("    A  — Re-visit ALL empty institutions")
+        print("    S  — Re-visit SPECIFIC institutions (enter numbers)")
+        print("    Q  — Quit / finish without re-visiting")
+        choice = input("\n  Your choice: ").strip().upper()
+
+        if choice == "Q":
+            print(cyan("  → Finishing without re-visit."))
+            break
+
+        elif choice == "A":
+            targets = empty_institutions[:]
+            newly_empty = _revisit_targets(driver, wait, master_list, targets,
+                                           institution_names, empty_institutions)
+            empty_institutions = newly_empty
+            if not empty_institutions:
+                print(green("  ✓ All previously-empty institutions now have data!"))
+                break
+
+        elif choice == "S":
+            raw = input(
+                "  Enter institution numbers from the list above "
+                "(comma-separated, e.g. 3,7,12): "
+            ).strip()
+            try:
+                chosen_display_nums = [int(x.strip()) for x in raw.split(",") if x.strip()]
+            except ValueError:
+                print(red("  ✗ Invalid input — please enter numbers only"))
+                continue
+
+            # Map display numbers back to empty_institutions entries
+            targets = []
+            for dn in chosen_display_nums:
+                match = [e for e in empty_institutions if e["index"] + 1 == dn]
+                if match:
+                    targets.append(match[0])
+                else:
+                    print(yellow(f"  ⚠ Number {dn} not in empty list — skipping"))
+
+            if not targets:
+                print(red("  ✗ No valid selections — try again"))
+                continue
+
+            newly_empty = _revisit_targets(driver, wait, master_list, targets,
+                                           institution_names, empty_institutions)
+            # Remove re-scraped ones from empty list
+            revisited_names = {t["name"] for t in targets}
+            still_empty = [e for e in empty_institutions if e["name"] in newly_empty_names(newly_empty)]
+            empty_institutions = still_empty
+            if not empty_institutions:
+                print(green("  ✓ No more empty institutions!"))
+                break
+        else:
+            print(red("  ✗ Unrecognised option — please enter A, S, or Q"))
+
+    return master_list
+
+
+def newly_empty_names(newly_empty):
+    return {e["name"] for e in newly_empty}
+
+
+def _revisit_targets(driver, wait, master_list, targets, institution_names, old_empty):
+    """Re-scrape target institutions. Returns list of still-empty entries."""
+    print(cyan(f"\n  → Re-visiting {len(targets)} institution(s)…"))
+    still_empty = []
+
+    bar = None
+    if TQDM_AVAILABLE:
+        bar = tqdm(targets, desc="  Re-scraping", unit="inst")
+
+    iterable = bar if bar else targets
+    for item in iterable:
+        uni_name = item["name"]
+        idx      = item["index"]
+
+        # Remove any previously collected (possibly partial) records for this institution
+        before = len(master_list)
+        master_list[:] = [r for r in master_list if r.get("Institution") != uni_name]
+        removed = before - len(master_list)
+        if removed:
+            print(yellow(f"      ℹ Removed {removed} old records for {uni_name} before re-scrape"))
+
+        data = scrape_institution(driver, wait, uni_name, idx, len(institution_names))
+
+        if data is None:
+            print(red(f"      ✗ Selection error for {uni_name}"))
+            still_empty.append(item)
+        elif len(data) == 0:
+            print(yellow(f"      ⚠ Still no data for {uni_name}"))
+            still_empty.append(item)
+        else:
+            master_list.extend(data)
+            print(green(f"      ✓ Collected {len(data)} records for {uni_name}"))
+
+        save_checkpoint(master_list, idx + 1, institution_names,
+                        [e for e in old_empty if e["name"] != uni_name])
+        time.sleep(0.5)
+
+    if bar:
+        bar.close()
+
+    return still_empty
+
+# ==========================================
+# SAVE RESULTS
+# ==========================================
+def save_results(master_list):
+    print("\n" + "=" * 60)
+    print(bold("  SAVING RESULTS"))
+    print("=" * 60)
+
+    with open(OUTPUT_JSON, 'w', encoding='utf-8') as f:
+        json.dump(master_list, f, indent=2, ensure_ascii=False)
+    print(green(f"  ✓ JSON  → {OUTPUT_JSON}  ({len(master_list)} records)"))
+
+    try:
+        df = pd.DataFrame(master_list)
+        df.to_excel(OUTPUT_EXCEL, index=False)
+        print(green(f"  ✓ Excel → {OUTPUT_EXCEL}"))
+    except Exception as e:
+        print(yellow(f"  ⚠ Excel save failed: {e}"))
+
+# ==========================================
+# MAIN
 # ==========================================
 def main():
     print("\n" + "=" * 60)
-    print("  PHASE 3: FACILITY METADATA HARVESTER")
+    print(bold("  PHASE 3: FACILITY METADATA HARVESTER  v2.0"))
     print("=" * 60)
 
-    driver = get_driver()
-    wait = WebDriverWait(driver, 20)
-    master_list = []
-    start_index = 0
+    # ── Checkpoint prompt BEFORE opening browser ──────────────────────────────
+    master_list        = []
+    start_index        = 0
+    institution_names  = []
+    empty_institutions = []
 
-    # Load Checkpoint
     checkpoint = load_checkpoint()
+    resume = False
+
     if checkpoint:
-        print(f"\n⚠ Found checkpoint: {checkpoint['facilities_collected']} collected")
-        if input("Resume? (y/n): ").lower() == 'y':
-            master_list = checkpoint['data']
-            start_index = checkpoint['current_index']
+        print(yellow(f"\n  ⚠  Checkpoint found:"))
+        print(f"      Timestamp  : {checkpoint.get('timestamp','?')}")
+        print(f"      Progress   : {checkpoint.get('current_index','?')} / "
+              f"{checkpoint.get('total_institutions','?')} institutions")
+        print(f"      Records    : {checkpoint.get('facilities_collected','?')}")
+        ans = input("\n  Resume from checkpoint? (y/n): ").strip().lower()
+        if ans == 'y':
+            master_list        = checkpoint.get('data', [])
+            start_index        = checkpoint.get('current_index', 0)
+            institution_names  = checkpoint.get('institution_names', [])
+            empty_institutions = checkpoint.get('empty_institutions', [])
+            resume = True
+            print(green(f"  ✓ Resuming from institution #{start_index + 1}"))
+        else:
+            print(cyan("  → Starting fresh"))
+    else:
+        print(cyan("  No checkpoint found — starting fresh"))
+
+    # ── NOW open the browser ──────────────────────────────────────────────────
+    print(cyan("\n  Opening browser…"))
+    driver = get_driver()
+    wait   = WebDriverWait(driver, 20)
 
     try:
         # Step 1: Login
         driver.get(LOGIN_URL)
-        print("\nSTEP 1: Please Log In.")
-        input(">>> Press ENTER when logged in...")
+        print(bold("\nSTEP 1: Please log in to the portal."))
+        input("  >>> Press ENTER when fully logged in… ")
 
         # Step 2: Navigate to Facilities
         driver.get(TARGET_URL)
-        print(f"\nNavigating to: {TARGET_URL}")
+        print(cyan(f"\n  Navigating to: {TARGET_URL}"))
+        wait_for_loading_complete(driver, timeout=20)
         time.sleep(PAGE_LOAD_WAIT)
 
-        # Step 3: Get Institutions
-        institution_names = get_institution_names(driver, wait)
+        # Step 3: Get institutions (if not loaded from checkpoint)
         if not institution_names:
-            print("✗ No institutions found in dropdown.")
-            return
+            institution_names = get_institution_names(driver, wait)
+            if not institution_names:
+                print(red("  ✗ No institutions found — aborting"))
+                return
 
-        # Step 4: Loop
-        print("\nSTEP 2: SCRAPING FACILITIES")
+        total_count = len(institution_names)
+
+        # Step 4: Main scrape loop
+        print(bold(f"\nSTEP 2: SCRAPING FACILITIES  ({total_count} institutions)\n"))
+
+        outer_bar = None
+        if TQDM_AVAILABLE:
+            outer_bar = tqdm(
+                total=total_count,
+                initial=start_index,
+                desc="  Institutions",
+                unit="inst",
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"
+            )
+
         for i, uni_name in enumerate(institution_names[start_index:], start=start_index):
-            print(f"\n[{i + 1}/{len(institution_names)}] {uni_name}")
 
-            if select_institution(driver, wait, uni_name):
-                data = scrape_all_pages_for_institution(driver, wait, uni_name)
-                master_list.extend(data)
-                print(f"      ✓ Total collected: {len(master_list)}")
+            data = scrape_institution(driver, wait, uni_name, i, total_count)
+
+            if data is None:
+                # Selection failed — treat as needing re-visit
+                empty_institutions.append({"index": i, "name": uni_name, "reason": "selection_failed"})
+            elif len(data) == 0:
+                print(yellow(f"      ⚠ No data collected for {uni_name}"))
+                empty_institutions.append({"index": i, "name": uni_name, "reason": "no_data"})
             else:
-                print("      ✗ Selection failed")
+                master_list.extend(data)
+                print(green(f"      ✓ {len(data)} records  |  Running total: {len(master_list)}"))
 
-            save_checkpoint(master_list, i + 1, institution_names)
+            if outer_bar:
+                outer_bar.update(1)
+
+            save_checkpoint(master_list, i + 1, institution_names, empty_institutions)
             time.sleep(0.5)
 
-        # Step 5: Save
+        if outer_bar:
+            outer_bar.close()
+
+        # Step 5: Summary
         print("\n" + "=" * 60)
-        print("SAVING RESULTS")
-        
-        with open(OUTPUT_JSON, 'w', encoding='utf-8') as f:
-            json.dump(master_list, f, indent=2)
-            
-        try:
-            pd.DataFrame(master_list).to_excel(OUTPUT_EXCEL, index=False)
-            print(f"✓ Saved to {OUTPUT_EXCEL}")
-        except:
-            pass
-            
+        print(bold("  SCRAPE COMPLETE — SUMMARY"))
+        print("=" * 60)
+        print(f"  Total institutions  : {total_count}")
+        print(green(f"  Records collected   : {len(master_list)}"))
+        if empty_institutions:
+            print(yellow(f"  Empty institutions  : {len(empty_institutions)}"))
+        else:
+            print(green("  Empty institutions  : 0"))
+
+        # Step 6: Save
+        save_results(master_list)
+
+        # Step 7: Post-scrape interactive re-visit menu
+        master_list = post_scrape_menu(
+            driver, wait, master_list, empty_institutions, institution_names
+        )
+
+        # Save final results again in case re-visits added data
+        save_results(master_list)
+        print(green("\n  ✓ All done!"))
+
+    except KeyboardInterrupt:
+        print(yellow("\n  ⚠  Interrupted by user — saving progress…"))
+        save_checkpoint(master_list, start_index, institution_names, empty_institutions)
+        save_results(master_list)
+
     except Exception as e:
-        print(f"\n✗ CRITICAL ERROR: {e}")
+        print(red(f"\n  ✗ CRITICAL ERROR: {e}"))
         import traceback
         traceback.print_exc()
-        
+        save_checkpoint(master_list, start_index, institution_names, empty_institutions)
+        save_results(master_list)
+
     finally:
-        print("\nScript finished.")
+        print(cyan("\n  Script finished."))
+
 
 if __name__ == "__main__":
     main()
